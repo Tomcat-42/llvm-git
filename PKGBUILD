@@ -88,6 +88,7 @@ build() {
         -D POLLY_ENABLE_GPGPU_CODEGEN=ON \
         -D LLDB_USE_SYSTEM_SIX=1 \
         -D LLVM_ENABLE_PROJECTS="polly;lldb;lld;compiler-rt;clang-tools-extra;clang" \
+        -D LLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
         -D LLVM_LIT_ARGS="-sv --ignore-fail" \
         -D LLVM_ENABLE_DUMP=ON \
         -Wno-dev
@@ -103,22 +104,37 @@ check() {
     ninja -C _build $NINJAFLAGS check-polly
     ninja -C _build $NINJAFLAGS check-lld
     ninja -C _build $NINJAFLAGS check-lldb
+    ninja -C _build $NINJAFLAGS check-cxx
+    ninja -C _build $NINJAFLAGS check-cxxabi
+    ninja -C _build $NINJAFLAGS check-unwind
 }
 
 package_llvm-git() {
     pkgdesc="LLVM development version. includes clang and many other tools"
     depends=("llvm-libs-git=$pkgver-$pkgrel" 'perl')
     optdepends=('python: for scripts')
-    provides=(aur-llvm-git compiler-rt-git clang-git lldb-git lld-git polly-git
-              llvm compiler-rt clang lldb polly lld )
+    provides=(aur-llvm-git compiler-rt-git clang-git lldb-git lld-git polly-git libc++-git libc++abi-git libunwind-git
+      llvm compiler-rt clang lldb polly lld libunwind libc++ libc++abi)
+
     # A package always provides itself, so there's no need to provide llvm-git
-    conflicts=('llvm' 'compiler-rt' 'clang' 'lldb' 'polly' 'lld')
+    conflicts=('llvm' 'compiler-rt' 'clang' 'lldb' 'polly' 'lld' 'libunwind' 'libc++' 'libc++abi')
     
     DESTDIR="$pkgdir" ninja -C _build $NINJAFLAGS install
 
     # Include lit for running lit-based tests in other projects
     pushd llvm-project/llvm/utils/lit
     python setup.py install --root="$pkgdir" -O1
+    popd
+
+    # Move libraries from platform-specific directory to standard directory
+    cp -r "$pkgdir"/usr/lib/x86_64-pc-linux-gnu/* "$pkgdir"/usr/lib/
+
+    # Move headers from platform-specific directory to standard directory
+    cp -r "$pkgdir"/usr/include/x86_64-pc-linux-gnu/* "$pkgdir"/usr/include/
+   
+    # Create symlink for libunwind
+    pushd "$pkgdir"/usr/lib
+    ln -s libunwind.so.1.0 libunwind.so.8
     popd
     
     # Move analyzer scripts out of /usr/libexec
@@ -207,3 +223,4 @@ package_llvm-ocaml-git() {
 
     install -Dm644 "$srcdir"/llvm-project/llvm/LICENSE.TXT  "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
 }
+

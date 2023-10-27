@@ -1,0 +1,1816 @@
+From df7c71d07f7db246aff0c6021e85acb70bd75868 Mon Sep 17 00:00:00 2001
+From: Chuanqi Xu <yedeng.yd@linux.alibaba.com>
+Date: Fri, 15 Sep 2023 11:33:53 +0800
+Subject: [PATCH 1/3] [clangd] [C++20] [Modules] Introduce initial support for
+ C++20 Modules
+
+Alternatives to https://reviews.llvm.org/D153114.
+
+Try to address https://github.com/clangd/clangd/issues/1293.
+
+See the links for design ideas. We want to have some initial support in
+clang18.
+
+This is the initial support for C++20 Modules in clangd.
+As suggested by sammccall in https://reviews.llvm.org/D153114,
+we should minimize the scope of the initial patch to make it easier
+to review and understand so that every one are in the same page:
+
+> Don't attempt any cross-file or cross-version coordination: i.e. don't
+> try to reuse BMIs between different files, don't try to reuse BMIs
+> between (preamble) reparses of the same file, don't try to persist the
+> module graph. Instead, when building a preamble, synchronously scan
+> for the module graph, build the required PCMs on the single preamble
+> thread with filenames private to that preamble, and then proceed to
+> build the preamble.
+
+And this patch reflects the above opinions.
+---
+ clang-tools-extra/clangd/CMakeLists.txt       |   3 +
+ clang-tools-extra/clangd/ClangdServer.cpp     |   1 +
+ clang-tools-extra/clangd/ClangdServer.h       |   3 +
+ .../clangd/GlobalCompilationDatabase.cpp      |  21 ++
+ .../clangd/GlobalCompilationDatabase.h        |   6 +
+ .../clangd/ModuleDependencyScanner.cpp        |  86 ++++++
+ .../clangd/ModuleDependencyScanner.h          |  78 +++++
+ clang-tools-extra/clangd/ModuleFilesInfo.cpp  | 282 ++++++++++++++++++
+ clang-tools-extra/clangd/ModuleFilesInfo.h    | 118 ++++++++
+ clang-tools-extra/clangd/ParsedAST.cpp        |   9 +
+ clang-tools-extra/clangd/Preamble.cpp         |  23 +-
+ clang-tools-extra/clangd/Preamble.h           |   7 +
+ clang-tools-extra/clangd/TUScheduler.cpp      |  13 +
+ clang-tools-extra/clangd/TUScheduler.h        |   3 +
+ clang-tools-extra/clangd/test/CMakeLists.txt  |   1 +
+ clang-tools-extra/clangd/test/modules.test    |  83 ++++++
+ clang-tools-extra/clangd/tool/Check.cpp       |   8 +-
+ clang-tools-extra/clangd/tool/ClangdMain.cpp  |   8 +
+ .../clangd/unittests/CMakeLists.txt           |   2 +
+ .../clangd/unittests/CodeCompleteTests.cpp    |  18 +-
+ .../clangd/unittests/FileIndexTests.cpp       |   5 +-
+ .../unittests/ModuleDependencyScannerTest.cpp | 179 +++++++++++
+ .../clangd/unittests/ModuleFilesInfoTest.cpp  | 229 ++++++++++++++
+ .../clangd/unittests/ModulesTestSetup.h       | 105 +++++++
+ .../clangd/unittests/ParsedASTTests.cpp       |   8 +-
+ .../clangd/unittests/PreambleTests.cpp        |   6 +-
+ clang-tools-extra/clangd/unittests/TestTU.cpp |  14 +-
+ clang-tools-extra/docs/ReleaseNotes.rst       |   3 +
+ 28 files changed, 1301 insertions(+), 21 deletions(-)
+ create mode 100644 clang-tools-extra/clangd/ModuleDependencyScanner.cpp
+ create mode 100644 clang-tools-extra/clangd/ModuleDependencyScanner.h
+ create mode 100644 clang-tools-extra/clangd/ModuleFilesInfo.cpp
+ create mode 100644 clang-tools-extra/clangd/ModuleFilesInfo.h
+ create mode 100644 clang-tools-extra/clangd/test/modules.test
+ create mode 100644 clang-tools-extra/clangd/unittests/ModuleDependencyScannerTest.cpp
+ create mode 100644 clang-tools-extra/clangd/unittests/ModuleFilesInfoTest.cpp
+ create mode 100644 clang-tools-extra/clangd/unittests/ModulesTestSetup.h
+
+diff --git a/clang-tools-extra/clangd/CMakeLists.txt b/clang-tools-extra/clangd/CMakeLists.txt
+index 3911fb6c6c74..bcfb49551a02 100644
+--- a/clang-tools-extra/clangd/CMakeLists.txt
++++ b/clang-tools-extra/clangd/CMakeLists.txt
+@@ -97,6 +97,8 @@ add_clang_library(clangDaemon
+   IncludeFixer.cpp
+   InlayHints.cpp
+   JSONTransport.cpp
++  ModuleDependencyScanner.cpp
++  ModuleFilesInfo.cpp
+   PathMapping.cpp
+   Protocol.cpp
+   Quality.cpp
+@@ -161,6 +163,7 @@ clang_target_link_libraries(clangDaemon
+   clangAST
+   clangASTMatchers
+   clangBasic
++  clangDependencyScanning
+   clangDriver
+   clangFormat
+   clangFrontend
+diff --git a/clang-tools-extra/clangd/ClangdServer.cpp b/clang-tools-extra/clangd/ClangdServer.cpp
+index 13d788162817..e4c85858b688 100644
+--- a/clang-tools-extra/clangd/ClangdServer.cpp
++++ b/clang-tools-extra/clangd/ClangdServer.cpp
+@@ -202,6 +202,7 @@ ClangdServer::Options::operator TUScheduler::Options() const {
+   Opts.UpdateDebounce = UpdateDebounce;
+   Opts.ContextProvider = ContextProvider;
+   Opts.PreambleThrottler = PreambleThrottler;
++  Opts.ExperimentalModulesSupport = ExperimentalModulesSupport;
+   return Opts;
+ }
+ 
+diff --git a/clang-tools-extra/clangd/ClangdServer.h b/clang-tools-extra/clangd/ClangdServer.h
+index a41660225142..dc546b118cb8 100644
+--- a/clang-tools-extra/clangd/ClangdServer.h
++++ b/clang-tools-extra/clangd/ClangdServer.h
+@@ -112,6 +112,9 @@ public:
+     /// This throttler controls which preambles may be built at a given time.
+     clangd::PreambleThrottler *PreambleThrottler = nullptr;
+ 
++    /// Enable experimental support for modules.
++    bool ExperimentalModulesSupport = false;
++
+     /// If true, ClangdServer builds a dynamic in-memory index for symbols in
+     /// opened files and uses the index to augment code completion results.
+     bool BuildDynamicSymbolIndex = false;
+diff --git a/clang-tools-extra/clangd/GlobalCompilationDatabase.cpp b/clang-tools-extra/clangd/GlobalCompilationDatabase.cpp
+index d1833759917a..bcc8f4f0dd9e 100644
+--- a/clang-tools-extra/clangd/GlobalCompilationDatabase.cpp
++++ b/clang-tools-extra/clangd/GlobalCompilationDatabase.cpp
+@@ -729,6 +729,20 @@ DirectoryBasedGlobalCompilationDatabase::getProjectInfo(PathRef File) const {
+   return Res->PI;
+ }
+ 
++std::vector<std::string>
++DirectoryBasedGlobalCompilationDatabase::getAllFilesInProjectOf(
++    PathRef File) const {
++  CDBLookupRequest Req;
++  Req.FileName = File;
++  Req.ShouldBroadcast = false;
++  Req.FreshTime = Req.FreshTimeMissing =
++      std::chrono::steady_clock::time_point::min();
++  auto Res = lookupCDB(Req);
++  if (!Res)
++    return {};
++  return Res->CDB->getAllFiles();
++}
++
+ OverlayCDB::OverlayCDB(const GlobalCompilationDatabase *Base,
+                        std::vector<std::string> FallbackFlags,
+                        CommandMangler Mangler)
+@@ -805,6 +819,13 @@ std::optional<ProjectInfo> DelegatingCDB::getProjectInfo(PathRef File) const {
+   return Base->getProjectInfo(File);
+ }
+ 
++std::vector<std::string>
++DelegatingCDB::getAllFilesInProjectOf(PathRef File) const {
++  if (!Base)
++    return {};
++  return Base->getAllFilesInProjectOf(File);
++}
++
+ tooling::CompileCommand DelegatingCDB::getFallbackCommand(PathRef File) const {
+   if (!Base)
+     return GlobalCompilationDatabase::getFallbackCommand(File);
+diff --git a/clang-tools-extra/clangd/GlobalCompilationDatabase.h b/clang-tools-extra/clangd/GlobalCompilationDatabase.h
+index 2bf8c973c534..eaeff8d627a0 100644
+--- a/clang-tools-extra/clangd/GlobalCompilationDatabase.h
++++ b/clang-tools-extra/clangd/GlobalCompilationDatabase.h
+@@ -45,6 +45,10 @@ public:
+     return std::nullopt;
+   }
+ 
++  virtual std::vector<std::string> getAllFilesInProjectOf(PathRef File) const {
++    return {};
++  }
++
+   /// Makes a guess at how to build a file.
+   /// The default implementation just runs clang on the file.
+   /// Clangd should treat the results as unreliable.
+@@ -75,6 +79,7 @@ public:
+   getCompileCommand(PathRef File) const override;
+ 
+   std::optional<ProjectInfo> getProjectInfo(PathRef File) const override;
++  std::vector<std::string> getAllFilesInProjectOf(PathRef File) const override;
+ 
+   tooling::CompileCommand getFallbackCommand(PathRef File) const override;
+ 
+@@ -121,6 +126,7 @@ public:
+   /// Returns the path to first directory containing a compilation database in
+   /// \p File's parents.
+   std::optional<ProjectInfo> getProjectInfo(PathRef File) const override;
++  std::vector<std::string> getAllFilesInProjectOf(PathRef File) const override;
+ 
+   bool blockUntilIdle(Deadline Timeout) const override;
+ 
+diff --git a/clang-tools-extra/clangd/ModuleDependencyScanner.cpp b/clang-tools-extra/clangd/ModuleDependencyScanner.cpp
+new file mode 100644
+index 000000000000..edadfe45d82c
+--- /dev/null
++++ b/clang-tools-extra/clangd/ModuleDependencyScanner.cpp
+@@ -0,0 +1,86 @@
++//===---------------- ModuleDependencyScanner.cpp ----------------*- C++-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "ModuleDependencyScanner.h"
++
++namespace clang {
++namespace clangd {
++using P1689Rule = tooling::dependencies::P1689Rule;
++
++std::optional<P1689Rule> ModuleDependencyScanner::scan(PathRef FilePath) {
++  if (ScanningCache.count(FilePath))
++    return ScanningCache[FilePath];
++
++  std::optional<tooling::CompileCommand> Cmd = CDB.getCompileCommand(FilePath);
++
++  if (!Cmd)
++    return std::nullopt;
++
++  using namespace clang::tooling::dependencies;
++
++  llvm::SmallString<128> FilePathDir(FilePath);
++  llvm::sys::path::remove_filename(FilePathDir);
++  DependencyScanningTool ScanningTool(
++      Service,
++      TFS ? TFS->view(FilePathDir) : llvm::vfs::createPhysicalFileSystem());
++
++  llvm::Expected<P1689Rule> Result =
++      ScanningTool.getP1689ModuleDependencyFile(*Cmd, Cmd->Directory);
++
++  if (auto E = Result.takeError()) {
++    // Ignore any error.
++    llvm::consumeError(std::move(E));
++    return std::nullopt;
++  }
++
++  if (Result->Provides)
++    ModuleNameToSourceMapper[Result->Provides->ModuleName] = FilePath;
++
++  ScanningCache[FilePath] = *Result;
++  return *Result;
++}
++
++void ModuleDependencyScanner::globalScan(PathRef File) {
++  std::vector<std::string> AllFiles = CDB.getAllFilesInProjectOf(File);
++
++  for (auto &File : AllFiles)
++    scan(File);
++}
++
++PathRef ModuleDependencyScanner::getSourceForModuleName(StringRef ModuleName) const {
++  if (!ModuleNameToSourceMapper.count(ModuleName))
++    return {};
++
++  return ModuleNameToSourceMapper.at(ModuleName);
++}
++
++std::vector<std::string>
++ModuleDependencyScanner::getRequiredModules(PathRef File) const {
++  if (!ScanningCache.count(File))
++    return {};
++
++  const P1689Rule &CachedResult = ScanningCache.at(File);
++  std::vector<std::string> Result;
++
++  for (const auto &Info : CachedResult.Requires)
++    Result.push_back(Info.ModuleName);
++
++  return Result;
++}
++
++StringRef ModuleDependencyScanner::getModuleName(PathRef File) const {
++  if (!ScanningCache.count(File))
++    return {};
++
++  if (!ScanningCache.at(File).Provides)
++    return {};
++
++  return ScanningCache.at(File).Provides->ModuleName;
++}
++} // namespace clangd
++} // namespace clang
+diff --git a/clang-tools-extra/clangd/ModuleDependencyScanner.h b/clang-tools-extra/clangd/ModuleDependencyScanner.h
+new file mode 100644
+index 000000000000..1d6eb58fda59
+--- /dev/null
++++ b/clang-tools-extra/clangd/ModuleDependencyScanner.h
+@@ -0,0 +1,78 @@
++//===-------------- ModuleDependencyScanner.h --------------------*- C++-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_CLANG_TOOLS_EXTRA_CLANGD_MODULEDEPENDENCYSCANNER_H
++#define LLVM_CLANG_TOOLS_EXTRA_CLANGD_MODULEDEPENDENCYSCANNER_H
++
++#include "GlobalCompilationDatabase.h"
++#include "support/Path.h"
++#include "support/ThreadsafeFS.h"
++
++#include "clang/Tooling/DependencyScanning/DependencyScanningService.h"
++#include "clang/Tooling/DependencyScanning/DependencyScanningTool.h"
++
++#include "llvm/ADT/SmallString.h"
++#include "llvm/ADT/StringMap.h"
++
++namespace clang {
++namespace clangd {
++
++/// A scanner to produce P1689 format for C++20 Modules.
++///
++/// The scanner can scan a single file with `scan(PathRef)` member function
++/// or scan the whole project with `globalScan(PathRef)` member function. See
++/// the comments of `globalScan` to see the details.
++class ModuleDependencyScanner {
++public:
++  ModuleDependencyScanner(const GlobalCompilationDatabase &CDB,
++                          const ThreadsafeFS *TFS)
++      : CDB(CDB), TFS(TFS),
++        Service(tooling::dependencies::ScanningMode::CanonicalPreprocessing,
++                tooling::dependencies::ScanningOutputFormat::P1689) {}
++
++  /// Scanning the single file specified by \param FilePath.
++  std::optional<clang::tooling::dependencies::P1689Rule> scan(PathRef FilePath);
++
++  /// Scanning every source file in the current project to get the
++  /// <module-name> to <module-unit-source> map.
++  /// It looks unefficiency to scan the whole project especially for
++  /// every version of every file!
++  /// TODO: We should find a efficient method to get the <module-name>
++  /// to <module-unit-source> map. We can make it either by providing
++  /// a global module dependency scanner to monitor every file. Or we
++  /// can simply require the build systems (or even if the end users)
++  /// to provide the map.
++  void globalScan(PathRef File);
++
++  PathRef getSourceForModuleName(StringRef ModuleName) const;
++
++  /// Return the direct required modules. Indirect required modules are not
++  /// included.
++  std::vector<std::string> getRequiredModules(PathRef File) const;
++  StringRef getModuleName(PathRef File) const;
++
++  const ThreadsafeFS *getThreadsafeFS() const { return TFS; }
++
++  const GlobalCompilationDatabase &getCompilationDatabase() const { return CDB; }
++
++private:
++  const GlobalCompilationDatabase &CDB;
++  const ThreadsafeFS *TFS;
++
++  clang::tooling::dependencies::DependencyScanningService Service;
++
++  // Map source file to P1689 Result.
++  llvm::StringMap<clang::tooling::dependencies::P1689Rule> ScanningCache;
++  // Map module name to source file path.
++  llvm::StringMap<std::string> ModuleNameToSourceMapper;
++};
++
++} // namespace clangd
++} // namespace clang
++
++#endif
+diff --git a/clang-tools-extra/clangd/ModuleFilesInfo.cpp b/clang-tools-extra/clangd/ModuleFilesInfo.cpp
+new file mode 100644
+index 000000000000..845ff01ca09d
+--- /dev/null
++++ b/clang-tools-extra/clangd/ModuleFilesInfo.cpp
+@@ -0,0 +1,282 @@
++//===----------------- ModuleFilesInfo.cpp -----------------------*- C++-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "ModuleFilesInfo.h"
++#include "support/Logger.h"
++
++#include "clang/Frontend/FrontendAction.h"
++#include "clang/Frontend/FrontendActions.h"
++#include "clang/Serialization/ASTReader.h"
++
++namespace clang {
++namespace clangd {
++
++namespace {
++llvm::SmallString<128> getAbsolutePath(const tooling::CompileCommand &Cmd) {
++  llvm::SmallString<128> AbsolutePath;
++  if (llvm::sys::path::is_absolute(Cmd.Filename)) {
++    AbsolutePath = Cmd.Filename;
++  } else {
++    AbsolutePath = Cmd.Directory;
++    llvm::sys::path::append(AbsolutePath, Cmd.Filename);
++    llvm::sys::path::remove_dots(AbsolutePath, true);
++  }
++  return AbsolutePath;
++}
++} // namespace
++
++ModuleFilesInfo::ModuleFilesInfo(PathRef MainFile,
++                                 const GlobalCompilationDatabase &CDB) {
++  std::optional<ProjectInfo> PI = CDB.getProjectInfo(MainFile);
++  if (!PI)
++    return;
++
++  llvm::SmallString<128> Result(PI->SourceRoot);
++  llvm::sys::path::append(Result, ".cache");
++  llvm::sys::path::append(Result, "clangd");
++  llvm::sys::path::append(Result, "module_files");
++  llvm::sys::fs::create_directories(Result, /*IgnoreExisting=*/true);
++
++  llvm::sys::path::append(Result, llvm::sys::path::filename(MainFile));
++  llvm::sys::fs::createUniqueDirectory(Result, UniqueModuleFilesPathPrefix);
++
++  log("Initialized module files to {0}", UniqueModuleFilesPathPrefix.str());
++}
++
++ModuleFilesInfo::~ModuleFilesInfo() {
++  DependentModuleNames.clear();
++  Successed = false;
++
++  if (UniqueModuleFilesPathPrefix.empty())
++    return;
++
++  llvm::sys::fs::remove_directories(UniqueModuleFilesPathPrefix);
++  UniqueModuleFilesPathPrefix.clear();
++}
++
++llvm::SmallString<256>
++ModuleFilesInfo::getModuleFilePath(StringRef ModuleName) const {
++  llvm::SmallString<256> ModuleFilePath;
++
++  ModuleFilePath = UniqueModuleFilesPathPrefix;
++  auto [PrimaryModuleName, PartitionName] = ModuleName.split(':');
++  llvm::sys::path::append(ModuleFilePath, PrimaryModuleName);
++  if (!PartitionName.empty()) {
++    ModuleFilePath.append("-");
++    ModuleFilePath.append(PartitionName);
++  }
++  ModuleFilePath.append(".pcm");
++
++  return ModuleFilePath;
++}
++
++bool ModuleFilesInfo::IsModuleUnitBuilt(StringRef ModuleName) const {
++  if (!DependentModuleNames.count(ModuleName))
++    return false;
++
++  auto BMIPath = getModuleFilePath(ModuleName);
++  if (llvm::sys::fs::exists(BMIPath))
++    return true;
++
++  Successed = false;
++
++  DependentModuleNames.erase(ModuleName);
++  return false;
++}
++
++void ModuleFilesInfo::ReplaceHeaderSearchOptions(
++    HeaderSearchOptions &Options) const {
++  if (!IsInited())
++    return;
++
++  Options.PrebuiltModulePaths.insert(Options.PrebuiltModulePaths.begin(),
++                                     UniqueModuleFilesPathPrefix.str().str());
++
++  for (auto Iter = Options.PrebuiltModuleFiles.begin();
++       Iter != Options.PrebuiltModuleFiles.end();) {
++    if (IsModuleUnitBuilt(Iter->first)) {
++      Iter = Options.PrebuiltModuleFiles.erase(Iter);
++      continue;
++    }
++
++    Iter++;
++  }
++}
++
++void ModuleFilesInfo::ReplaceCompileCommands(
++    tooling::CompileCommand &Cmd) const {
++  if (!IsInited())
++    return;
++
++  std::vector<std::string> CommandLine(std::move(Cmd.CommandLine));
++
++  Cmd.CommandLine.emplace_back(CommandLine[0]);
++  Cmd.CommandLine.emplace_back(
++      llvm::Twine("-fprebuilt-module-path=" + UniqueModuleFilesPathPrefix)
++          .str());
++
++  for (std::size_t I = 1; I < CommandLine.size(); I++) {
++    const std::string &Arg = CommandLine[I];
++    const auto &[LHS, RHS] = StringRef(Arg).split("=");
++
++    // Remove original `-fmodule-file=<module-name>=<module-path>` form if it
++    // already built.
++    if (LHS == "-fmodule-file" && RHS.contains("=")) {
++      const auto &[ModuleName, _] = RHS.split("=");
++      if (IsModuleUnitBuilt(ModuleName))
++        continue;
++    }
++
++    Cmd.CommandLine.emplace_back(Arg);
++  }
++}
++
++void ModuleFilesInfo::ReplaceCompileCommands(tooling::CompileCommand &Cmd,
++                                             StringRef OutputModuleName) const {
++  if (!IsInited())
++    return;
++
++  ReplaceCompileCommands(Cmd);
++
++  Cmd.Output = getModuleFilePath(OutputModuleName).str().str();
++}
++
++bool ModuleFilesInfo::buildModuleFile(PathRef ModuleUnitFileName,
++                                      ModuleDependencyScanner &Scanner) {
++  if (ModuleUnitFileName.empty())
++    return false;
++
++  for (auto &ModuleName : Scanner.getRequiredModules(ModuleUnitFileName)) {
++    // Return early if there are errors building the module file.
++    if (!IsModuleUnitBuilt(ModuleName) &&
++        !buildModuleFile(Scanner.getSourceForModuleName(ModuleName), Scanner)) {
++      log("Failed to build module {0}", ModuleName);
++      return false;
++    }
++  }
++
++  auto Cmd =
++      Scanner.getCompilationDatabase().getCompileCommand(ModuleUnitFileName);
++  if (!Cmd)
++    return false;
++
++  ReplaceCompileCommands(*Cmd, Scanner.getModuleName(ModuleUnitFileName));
++
++  ParseInputs Inputs;
++  Inputs.TFS = Scanner.getThreadsafeFS();
++  Inputs.CompileCommand = std::move(*Cmd);
++
++  IgnoreDiagnostics IgnoreDiags;
++  auto CI = buildCompilerInvocation(Inputs, IgnoreDiags);
++  if (!CI)
++    return false;
++
++  auto FS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
++  auto AbsolutePath = getAbsolutePath(Inputs.CompileCommand);
++  auto Buf = FS->getBufferForFile(AbsolutePath);
++  if (!Buf)
++    return false;
++
++  // Hash the contents of input files and store the hash value to the BMI files.
++  // So that we can check if the files are still valid when we want to reuse the
++  // BMI files.
++  CI->getHeaderSearchOpts().ValidateASTInputFilesContent = true;
++
++  CI->getFrontendOpts().OutputFile = Inputs.CompileCommand.Output;
++  auto Clang =
++      prepareCompilerInstance(std::move(CI), /*Preamble=*/nullptr,
++                              std::move(*Buf), std::move(FS), IgnoreDiags);
++  if (!Clang)
++    return false;
++
++  GenerateModuleInterfaceAction Action;
++  Clang->ExecuteAction(Action);
++
++  if (Clang->getDiagnostics().hasErrorOccurred())
++    return false;
++
++  DependentModuleNames.insert(Scanner.getModuleName(ModuleUnitFileName));
++
++  return true;
++}
++
++ModuleFilesInfo
++ModuleFilesInfo::buildModuleFilesInfoFor(PathRef File, const ThreadsafeFS *TFS,
++                                         const GlobalCompilationDatabase &CDB) {
++  ModuleDependencyScanner Scanner(CDB, TFS);
++
++  std::optional<tooling::dependencies::P1689Rule> ScanningResult =
++      Scanner.scan(File);
++  if (!ScanningResult)
++    return {};
++
++  ModuleFilesInfo ModulesInfo(File, CDB);
++
++  Scanner.globalScan(File);
++
++  for (auto &Info : ScanningResult->Requires)
++    // Return early if there is any error.
++    if (!ModulesInfo.buildModuleFile(
++            Scanner.getSourceForModuleName(Info.ModuleName), Scanner)) {
++      log("Failed to build module {0}", Info.ModuleName);
++      return ModulesInfo;
++    }
++
++  ModulesInfo.Successed = true;
++  return ModulesInfo;
++}
++
++bool ModuleFilesInfo::CanReuse(
++    const CompilerInvocation &CI,
++    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS) const {
++  // Try to avoid expensive check as much as possible.
++  if (!IsInited())
++    return true;
++
++  if (!Successed)
++    return false;
++
++  CompilerInstance Clang;
++
++  Clang.setInvocation(std::make_shared<CompilerInvocation>(CI));
++  IntrusiveRefCntPtr<DiagnosticsEngine> Diags =
++      CompilerInstance::createDiagnostics(new DiagnosticOptions());
++  Clang.setDiagnostics(Diags.get());
++
++  FileManager *FM = Clang.createFileManager(VFS);
++  Clang.createSourceManager(*FM);
++
++  if (!Clang.createTarget())
++    return false;
++
++  ReplaceHeaderSearchOptions(Clang.getHeaderSearchOpts());
++  // Since we don't need to compile the source code actually, the TU kind here
++  // doesn't matter.
++  Clang.createPreprocessor(TU_Complete);
++  Clang.getHeaderSearchOpts().ForceCheckCXX20ModulesInputFiles = true;
++  Clang.getHeaderSearchOpts().ValidateASTInputFilesContent = true;
++
++  Clang.createASTReader();
++  for (auto &Iter : DependentModuleNames) {
++    StringRef ModuleName = Iter.first();
++    auto BMIPath = getModuleFilePath(ModuleName);
++    auto ReadResult =
++        Clang.getASTReader()->ReadAST(BMIPath, serialization::MK_MainFile,
++                                      SourceLocation(), ASTReader::ARR_None);
++
++    if (ReadResult != ASTReader::Success) {
++      log("Failed to reuse {0}", BMIPath);
++      return false;
++    }
++  }
++
++  return true;
++}
++
++} // namespace clangd
++} // namespace clang
+diff --git a/clang-tools-extra/clangd/ModuleFilesInfo.h b/clang-tools-extra/clangd/ModuleFilesInfo.h
+new file mode 100644
+index 000000000000..557233f87076
+--- /dev/null
++++ b/clang-tools-extra/clangd/ModuleFilesInfo.h
+@@ -0,0 +1,118 @@
++//===----------------- ModuleFilesInfo.h -------------------------*- C++-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Experimental support for C++20 Modules.
++//
++// Currently we simplify the implementations by preventing reusing module files
++// across different versions and different source files. But this is clearly a
++// waste of time and space in the end of the day.
++//
++// FIXME: Supporting reusing module files across different versions and different
++// source files.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_CLANG_TOOLS_EXTRA_CLANGD_MODULEFILESINFO_H
++#define LLVM_CLANG_TOOLS_EXTRA_CLANGD_MODULEFILESINFO_H
++
++#include "Compiler.h"
++#include "GlobalCompilationDatabase.h"
++#include "ModuleDependencyScanner.h"
++#include "support/Path.h"
++
++#include "clang/Lex/HeaderSearchOptions.h"
++
++#include "llvm/ADT/SmallString.h"
++#include "llvm/ADT/StringMap.h"
++
++namespace clang {
++namespace clangd {
++
++/// Store module files information for a single file.
++///
++/// A ModuleFilesInfo should only be initialized by
++/// `ModuleFilesInfo::buildModuleFilesInfoFor(PathRef, const ThreadsafeFS *, const GlobalCompilationDatabase &)`
++/// static member method. This method will block the current thread and build all the needed
++/// module files. All the built module files won't be shared with other source files.
++///
++/// Users can detect whether the ModuleFilesInfo is still up to date by calling
++/// the `CanReuse()` member function.
++///
++/// The users should call `ReplaceHeaderSearchOptions(...)` or `ReplaceCompileCommands(CompileCommand&)`
++/// member function to update the compilation commands to select the built module files first.
++struct ModuleFilesInfo {
++  ModuleFilesInfo() = default;
++  ~ModuleFilesInfo();
++
++  ModuleFilesInfo(const ModuleFilesInfo &) = delete;
++  ModuleFilesInfo operator=(const ModuleFilesInfo &) = delete;
++
++  ModuleFilesInfo(ModuleFilesInfo &&Other)
++      : Successed(std::exchange(Other.Successed, false)),
++        UniqueModuleFilesPathPrefix(
++            std::move(Other.UniqueModuleFilesPathPrefix)),
++        DependentModuleNames(std::move(Other.DependentModuleNames)) {
++    Other.UniqueModuleFilesPathPrefix.clear();
++  }
++  ModuleFilesInfo &operator=(ModuleFilesInfo &&Other) {
++    if (this == &Other)
++      return *this;
++
++    this->~ModuleFilesInfo();
++    new (this) ModuleFilesInfo(std::move(Other));
++
++    return *this;
++  }
++
++  /// Build all the required module files for \param File.
++  /// Note that only the module files recorded by \param CDB can be built.
++  static ModuleFilesInfo
++  buildModuleFilesInfoFor(PathRef File, const ThreadsafeFS *TFS,
++                          const GlobalCompilationDatabase &CDB);
++
++  /// Return true if the modile file specified by ModuleName is built.
++  /// Note that this interface will only check the existence of the module
++  /// file instead of checking the validness of the module file. 
++  bool IsModuleUnitBuilt(StringRef ModuleName) const;
++
++  /// Change commands to load the module files recorded in this ModuleFilesInfo
++  /// first.
++  void ReplaceHeaderSearchOptions(HeaderSearchOptions &Options) const;
++  void ReplaceCompileCommands(tooling::CompileCommand &Cmd) const;
++  void ReplaceCompileCommands(tooling::CompileCommand &Cmd,
++                              StringRef OutputModuleName) const;
++
++  /// Whether or not the built module files are up to date.
++  /// Note that this can only be used after building the module files.
++  bool CanReuse(const CompilerInvocation &CI,
++                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>) const;
++
++  /// NOTE: This shouldn't be used by external users except unittests.
++  llvm::SmallString<256> getModuleFilePath(StringRef ModuleName) const;
++
++private:
++  ModuleFilesInfo(PathRef MainFile, const GlobalCompilationDatabase &CDB);
++
++  bool IsInited() const { return !UniqueModuleFilesPathPrefix.empty(); }
++  bool buildModuleFile(PathRef ModuleUnitFileName,
++                       ModuleDependencyScanner &Scanner);
++
++  // Whether the last built is successed.
++  // May change in `IsModuleUnitBuilt`.
++  mutable bool Successed = false;
++
++  llvm::SmallString<256> UniqueModuleFilesPathPrefix;
++  // The language guarantees that the module name is unique in a program.
++  // May change in `IsModuleUnitBuilt`.
++  mutable llvm::StringSet<> DependentModuleNames;
++};
++
++} // namespace clangd
++} // namespace clang
++
++#endif
+diff --git a/clang-tools-extra/clangd/ParsedAST.cpp b/clang-tools-extra/clangd/ParsedAST.cpp
+index 3f6c0eaebac6..3e9480093ebe 100644
+--- a/clang-tools-extra/clangd/ParsedAST.cpp
++++ b/clang-tools-extra/clangd/ParsedAST.cpp
+@@ -429,6 +429,12 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
+           L->sawDiagnostic(D, Diag);
+       });
+ 
++  // Replace header search options to load the built module files recorded
++  // in DependentModulesInfo.
++  if (Preamble)
++    Preamble->DependentModulesInfo.ReplaceHeaderSearchOptions(
++        CI->getHeaderSearchOpts());
++
+   std::optional<PreamblePatch> Patch;
+   // We might use an ignoring diagnostic consumer if they are going to be
+   // dropped later on to not pay for extra latency by processing them.
+@@ -442,6 +448,9 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
+       std::move(CI), PreamblePCH,
+       llvm::MemoryBuffer::getMemBufferCopy(Inputs.Contents, Filename), VFS,
+       *DiagConsumer);
++
++  // Clangd Modules TODO: refactor the command line options of `Clang` here.
++
+   if (!Clang) {
+     // The last diagnostic contains information about the reason of this
+     // failure.
+diff --git a/clang-tools-extra/clangd/Preamble.cpp b/clang-tools-extra/clangd/Preamble.cpp
+index 60c0f936d6f3..6e0a39f40e7f 100644
+--- a/clang-tools-extra/clangd/Preamble.cpp
++++ b/clang-tools-extra/clangd/Preamble.cpp
+@@ -587,11 +587,11 @@ public:
+ };
+ } // namespace
+ 
+-std::shared_ptr<const PreambleData>
+-buildPreamble(PathRef FileName, CompilerInvocation CI,
+-              const ParseInputs &Inputs, bool StoreInMemory,
+-              PreambleParsedCallback PreambleCallback,
+-              PreambleBuildStats *Stats) {
++std::shared_ptr<const PreambleData> buildPreamble(
++    PathRef FileName, CompilerInvocation CI, const ParseInputs &Inputs,
++    bool StoreInMemory, bool ExperimentalModulesSupport,
++    const GlobalCompilationDatabase &CDB,
++    PreambleParsedCallback PreambleCallback, PreambleBuildStats *Stats) {
+   // Note that we don't need to copy the input contents, preamble can live
+   // without those.
+   auto ContentsBuffer =
+@@ -660,10 +660,17 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
+ 
+   WallTimer PreambleTimer;
+   PreambleTimer.startTimer();
++
++  ModuleFilesInfo DependentModulesInfo =
++      !ExperimentalModulesSupport
++          ? ModuleFilesInfo{}
++          : ModuleFilesInfo::buildModuleFilesInfoFor(FileName, Inputs.TFS, CDB);
++
+   auto BuiltPreamble = PrecompiledPreamble::Build(
+       CI, ContentsBuffer.get(), Bounds, *PreambleDiagsEngine,
+       Stats ? TimedFS : StatCacheFS, std::make_shared<PCHContainerOperations>(),
+       StoreInMemory, /*StoragePath=*/"", CapturedInfo);
++
+   PreambleTimer.stopTimer();
+ 
+   // We have to setup DiagnosticConsumer that will be alife
+@@ -696,6 +703,9 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
+     Result->Includes = CapturedInfo.takeIncludes();
+     Result->Pragmas = std::make_shared<const include_cleaner::PragmaIncludes>(
+         CapturedInfo.takePragmaIncludes());
++
++    // FIXME: If there is no headers?
++    Result->DependentModulesInfo = std::move(DependentModulesInfo);
+     Result->Macros = CapturedInfo.takeMacros();
+     Result->Marks = CapturedInfo.takeMarks();
+     Result->StatCache = StatCache;
+@@ -736,7 +746,8 @@ bool isPreambleCompatible(const PreambleData &Preamble,
+   auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
+   return compileCommandsAreEqual(Inputs.CompileCommand,
+                                  Preamble.CompileCommand) &&
+-         Preamble.Preamble.CanReuse(CI, *ContentsBuffer, Bounds, *VFS);
++         Preamble.Preamble.CanReuse(CI, *ContentsBuffer, Bounds, *VFS) &&
++         Preamble.DependentModulesInfo.CanReuse(CI, VFS);
+ }
+ 
+ void escapeBackslashAndQuotes(llvm::StringRef Text, llvm::raw_ostream &OS) {
+diff --git a/clang-tools-extra/clangd/Preamble.h b/clang-tools-extra/clangd/Preamble.h
+index 21a281aac0cc..fb390c025597 100644
+--- a/clang-tools-extra/clangd/Preamble.h
++++ b/clang-tools-extra/clangd/Preamble.h
+@@ -27,6 +27,9 @@
+ #include "Diagnostics.h"
+ #include "FS.h"
+ #include "Headers.h"
++
++#include "ModuleFilesInfo.h"
++
+ #include "clang-include-cleaner/Record.h"
+ #include "support/Path.h"
+ #include "clang/Basic/SourceManager.h"
+@@ -104,6 +107,8 @@ struct PreambleData {
+   IncludeStructure Includes;
+   // Captures #include-mapping information in #included headers.
+   std::shared_ptr<const include_cleaner::PragmaIncludes> Pragmas;
++  // Information about module files for this preamble.
++  ModuleFilesInfo DependentModulesInfo;
+   // Macros defined in the preamble section of the main file.
+   // Users care about headers vs main-file, not preamble vs non-preamble.
+   // These should be treated as main-file entities e.g. for code completion.
+@@ -147,6 +152,8 @@ struct PreambleBuildStats {
+ std::shared_ptr<const PreambleData>
+ buildPreamble(PathRef FileName, CompilerInvocation CI,
+               const ParseInputs &Inputs, bool StoreInMemory,
++              bool ExperimentalModulesSupport,
++              const GlobalCompilationDatabase &CDB,
+               PreambleParsedCallback PreambleCallback,
+               PreambleBuildStats *Stats = nullptr);
+ 
+diff --git a/clang-tools-extra/clangd/TUScheduler.cpp b/clang-tools-extra/clangd/TUScheduler.cpp
+index 324ba1fc8cb8..35e0f4205a9c 100644
+--- a/clang-tools-extra/clangd/TUScheduler.cpp
++++ b/clang-tools-extra/clangd/TUScheduler.cpp
+@@ -652,6 +652,12 @@ public:
+   TUScheduler::FileStats stats() const;
+   bool isASTCached() const;
+ 
++  const GlobalCompilationDatabase &getCompilationDatabase() { return CDB; }
++
++  bool isExperimentalModulesSupportEnabled() const {
++    return ExperimentalModulesSupport;
++  }
++
+ private:
+   // Details of an update request that are relevant to scheduling.
+   struct UpdateType {
+@@ -710,6 +716,10 @@ private:
+   TUScheduler::ASTCache &IdleASTs;
+   TUScheduler::HeaderIncluderCache &HeaderIncluders;
+   const bool RunSync;
++
++  /// Enable experimental support for modules.
++  bool ExperimentalModulesSupport = false;
++
+   /// Time to wait after an update to see whether another update obsoletes it.
+   const DebouncePolicy UpdateDebounce;
+   /// File that ASTWorker is responsible for.
+@@ -834,6 +844,7 @@ ASTWorker::ASTWorker(PathRef FileName, const GlobalCompilationDatabase &CDB,
+                      const TUScheduler::Options &Opts,
+                      ParsingCallbacks &Callbacks)
+     : IdleASTs(LRUCache), HeaderIncluders(HeaderIncluders), RunSync(RunSync),
++      ExperimentalModulesSupport(Opts.ExperimentalModulesSupport),
+       UpdateDebounce(Opts.UpdateDebounce), FileName(FileName),
+       ContextProvider(Opts.ContextProvider), CDB(CDB), Callbacks(Callbacks),
+       Barrier(Barrier), Done(false), Status(FileName, Callbacks),
+@@ -1084,6 +1095,8 @@ void PreambleThread::build(Request Req) {
+   bool IsFirstPreamble = !LatestBuild;
+   LatestBuild = clang::clangd::buildPreamble(
+       FileName, *Req.CI, Inputs, StoreInMemory,
++      ASTPeer.isExperimentalModulesSupportEnabled(),
++      ASTPeer.getCompilationDatabase(),
+       [&](CapturedASTCtx ASTCtx,
+           std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+         Callbacks.onPreambleAST(FileName, Inputs.Version, std::move(ASTCtx),
+diff --git a/clang-tools-extra/clangd/TUScheduler.h b/clang-tools-extra/clangd/TUScheduler.h
+index fb936d46bbcf..706a13c59dd3 100644
+--- a/clang-tools-extra/clangd/TUScheduler.h
++++ b/clang-tools-extra/clangd/TUScheduler.h
+@@ -222,6 +222,9 @@ public:
+     /// Cache (large) preamble data in RAM rather than temporary files on disk.
+     bool StorePreamblesInMemory = false;
+ 
++    /// Enable experimental support for modules.
++    bool ExperimentalModulesSupport = false;
++
+     /// Time to wait after an update to see if another one comes along.
+     /// This tries to ensure we rebuild once the user stops typing.
+     DebouncePolicy UpdateDebounce;
+diff --git a/clang-tools-extra/clangd/test/CMakeLists.txt b/clang-tools-extra/clangd/test/CMakeLists.txt
+index d073267066e0..b51f461a4986 100644
+--- a/clang-tools-extra/clangd/test/CMakeLists.txt
++++ b/clang-tools-extra/clangd/test/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(CLANGD_TEST_DEPS
+   clangd
+   ClangdTests
+   clangd-indexer
++  split-file
+   # No tests for it, but we should still make sure they build.
+   dexp
+   )
+diff --git a/clang-tools-extra/clangd/test/modules.test b/clang-tools-extra/clangd/test/modules.test
+new file mode 100644
+index 000000000000..74280811a6cf
+--- /dev/null
++++ b/clang-tools-extra/clangd/test/modules.test
+@@ -0,0 +1,83 @@
++# A smoke test to check the modules can work basically.
++#
++# Windows have different escaping modes.
++# FIXME: We should add one for windows.
++# UNSUPPORTED: system-windows
++#
++# RUN: rm -fr %t
++# RUN: mkdir -p %t
++# RUN: split-file %s %t
++#
++# RUN: sed -e "s|DIR|%/t|g" %t/compile_commands.json.tmpl > %t/compile_commands.json.tmp
++# RUN: sed -e "s|CLANG_CC|%clang|g" %t/compile_commands.json.tmp > %t/compile_commands.json
++# RUN: sed -e "s|DIR|%/t|g" %t/definition.jsonrpc.tmpl > %t/definition.jsonrpc
++#
++# RUN: clangd -experimental-modules-support -lit-test < %t/definition.jsonrpc \
++# RUN:      | FileCheck -strict-whitespace %t/definition.jsonrpc
++
++#--- A.cppm
++export module A;
++export void printA() {}
++
++#--- Use.cpp
++import A;
++void foo() {
++    print
++}
++
++#--- compile_commands.json.tmpl
++[
++    {
++      "directory": "DIR",
++      "command": "CLANG_CC -fprebuilt-module-path=DIR -std=c++20 -o DIR/main.cpp.o -c DIR/Use.cpp",
++      "file": "DIR/Use.cpp"
++    },
++    {
++      "directory": "DIR",
++      "command": "CLANG_CC -std=c++20 DIR/A.cppm --precompile -o DIR/A.pcm",
++      "file": "DIR/A.cppm"
++    }
++]
++
++#--- definition.jsonrpc.tmpl
++{
++  "jsonrpc": "2.0",
++  "id": 0,
++  "method": "initialize",
++  "params": {
++    "processId": 123,
++    "rootPath": "clangd",
++    "capabilities": {
++      "textDocument": {
++        "completion": {
++          "completionItem": {
++            "snippetSupport": true
++          }
++        }
++      }
++    },
++    "trace": "off"
++  }
++}
++---
++{
++  "jsonrpc": "2.0",
++  "method": "textDocument/didOpen",
++  "params": {
++    "textDocument": {
++      "uri": "file://DIR/Use.cpp",
++      "languageId": "cpp",
++      "version": 1,
++      "text": "import A;\nvoid foo() {\n    print\n}\n"
++    }
++  }
++}
++
++# CHECK: "message"{{.*}}printA{{.*}}(fix available)
++
++---
++{"jsonrpc":"2.0","id":1,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://DIR/Use.cpp"},"context":{"triggerKind":1},"position":{"line":2,"character":6}}}
++---
++{"jsonrpc":"2.0","id":2,"method":"shutdown"}
++---
++{"jsonrpc":"2.0","method":"exit"}
+diff --git a/clang-tools-extra/clangd/tool/Check.cpp b/clang-tools-extra/clangd/tool/Check.cpp
+index 46fcab0b69ce..b3ae59ae7c4f 100644
+--- a/clang-tools-extra/clangd/tool/Check.cpp
++++ b/clang-tools-extra/clangd/tool/Check.cpp
+@@ -140,6 +140,8 @@ class Checker {
+   ClangdLSPServer::Options Opts;
+   // from buildCommand
+   tooling::CompileCommand Cmd;
++  std::unique_ptr<GlobalCompilationDatabase> BaseCDB;
++  std::unique_ptr<OverlayCDB> CDB;
+   // from buildInvocation
+   ParseInputs Inputs;
+   std::unique_ptr<CompilerInvocation> Invocation;
+@@ -162,14 +164,14 @@ public:
+     DirectoryBasedGlobalCompilationDatabase::Options CDBOpts(TFS);
+     CDBOpts.CompileCommandsDir =
+         Config::current().CompileFlags.CDBSearch.FixedCDBPath;
+-    std::unique_ptr<GlobalCompilationDatabase> BaseCDB =
++    BaseCDB =
+         std::make_unique<DirectoryBasedGlobalCompilationDatabase>(CDBOpts);
+     auto Mangler = CommandMangler::detect();
+     Mangler.SystemIncludeExtractor =
+         getSystemIncludeExtractor(llvm::ArrayRef(Opts.QueryDriverGlobs));
+     if (Opts.ResourceDir)
+       Mangler.ResourceDir = *Opts.ResourceDir;
+-    auto CDB = std::make_unique<OverlayCDB>(
++    CDB = std::make_unique<OverlayCDB>(
+         BaseCDB.get(), std::vector<std::string>{}, std::move(Mangler));
+ 
+     if (auto TrueCmd = CDB->getCompileCommand(File)) {
+@@ -230,6 +232,8 @@ public:
+     log("Building preamble...");
+     Preamble = buildPreamble(
+         File, *Invocation, Inputs, /*StoreInMemory=*/true,
++        /*ExperimentalModulesSupport*/ Opts.ExperimentalModulesSupport,
++        *CDB.get(),
+         [&](CapturedASTCtx Ctx,
+             std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+           if (!Opts.BuildDynamicSymbolIndex)
+diff --git a/clang-tools-extra/clangd/tool/ClangdMain.cpp b/clang-tools-extra/clangd/tool/ClangdMain.cpp
+index f656a8c587c6..e38b7c567fb7 100644
+--- a/clang-tools-extra/clangd/tool/ClangdMain.cpp
++++ b/clang-tools-extra/clangd/tool/ClangdMain.cpp
+@@ -550,6 +550,13 @@ opt<std::string> ProjectRoot{
+ };
+ #endif
+ 
++opt<bool> ExperimentalModulesSupport{
++    "experimental-modules-support",
++    cat(Features),
++    desc("Experimental support for standard c++ modules"),
++    init(false),
++};
++
+ /// Supports a test URI scheme with relaxed constraints for lit tests.
+ /// The path in a test URI will be combined with a platform-specific fake
+ /// directory to form an absolute path. For example, test:///a.cpp is resolved
+@@ -861,6 +868,7 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
+ 
+   ClangdLSPServer::Options Opts;
+   Opts.UseDirBasedCDB = (CompileArgsFrom == FilesystemCompileArgs);
++  Opts.ExperimentalModulesSupport = ExperimentalModulesSupport;
+ 
+   switch (PCHStorage) {
+   case PCHStorageFlag::Memory:
+diff --git a/clang-tools-extra/clangd/unittests/CMakeLists.txt b/clang-tools-extra/clangd/unittests/CMakeLists.txt
+index 8d02b91fdd71..cd79534c6a97 100644
+--- a/clang-tools-extra/clangd/unittests/CMakeLists.txt
++++ b/clang-tools-extra/clangd/unittests/CMakeLists.txt
+@@ -72,6 +72,8 @@ add_unittest(ClangdUnitTests ClangdTests
+   LoggerTests.cpp
+   LSPBinderTests.cpp
+   LSPClient.cpp
++  ModuleDependencyScannerTest.cpp
++  ModuleFilesInfoTest.cpp
+   ModulesTests.cpp
+   ParsedASTTests.cpp
+   PathMappingTests.cpp
+diff --git a/clang-tools-extra/clangd/unittests/CodeCompleteTests.cpp b/clang-tools-extra/clangd/unittests/CodeCompleteTests.cpp
+index 671c0b7da97c..095c05210caf 100644
+--- a/clang-tools-extra/clangd/unittests/CodeCompleteTests.cpp
++++ b/clang-tools-extra/clangd/unittests/CodeCompleteTests.cpp
+@@ -132,8 +132,11 @@ CodeCompleteResult completions(const TestTU &TU, Position Point,
+     ADD_FAILURE() << "Couldn't build CompilerInvocation";
+     return {};
+   }
++
++  MockCompilationDatabase CDB;
+   auto Preamble = buildPreamble(testPath(TU.Filename), *CI, Inputs,
+-                                /*InMemory=*/true, /*Callback=*/nullptr);
++                                /*ExperimentalModulesSupport=*/false,
++                                /*InMemory=*/true, CDB, /*Callback=*/nullptr);
+   return codeComplete(testPath(TU.Filename), Point, Preamble.get(), Inputs,
+                       Opts);
+ }
+@@ -1322,8 +1325,11 @@ signatures(llvm::StringRef Text, Position Point,
+     ADD_FAILURE() << "Couldn't build CompilerInvocation";
+     return {};
+   }
++
++  MockCompilationDatabase CDB;
+   auto Preamble = buildPreamble(testPath(TU.Filename), *CI, Inputs,
+-                                /*InMemory=*/true, /*Callback=*/nullptr);
++                                /*ExperimentalModulesSupport=*/false,
++                                /*InMemory=*/true, CDB, /*Callback=*/nullptr);
+   if (!Preamble) {
+     ADD_FAILURE() << "Couldn't build Preamble";
+     return {};
+@@ -1604,8 +1610,12 @@ TEST(SignatureHelpTest, StalePreamble) {
+   auto Inputs = TU.inputs(FS);
+   auto CI = buildCompilerInvocation(Inputs, Diags);
+   ASSERT_TRUE(CI);
+-  auto EmptyPreamble = buildPreamble(testPath(TU.Filename), *CI, Inputs,
+-                                     /*InMemory=*/true, /*Callback=*/nullptr);
++
++  MockCompilationDatabase CDB;
++  auto EmptyPreamble =
++      buildPreamble(testPath(TU.Filename), *CI, Inputs,
++                    /*ExperimentalModulesSupport=*/false,
++                    /*InMemory=*/true, CDB, /*Callback=*/nullptr);
+   ASSERT_TRUE(EmptyPreamble);
+ 
+   TU.AdditionalFiles["a.h"] = "int foo(int x);";
+diff --git a/clang-tools-extra/clangd/unittests/FileIndexTests.cpp b/clang-tools-extra/clangd/unittests/FileIndexTests.cpp
+index cf30b388d234..d8d1c076a7da 100644
+--- a/clang-tools-extra/clangd/unittests/FileIndexTests.cpp
++++ b/clang-tools-extra/clangd/unittests/FileIndexTests.cpp
+@@ -336,9 +336,12 @@ TEST(FileIndexTest, RebuildWithPreamble) {
+ 
+   FileIndex Index;
+   bool IndexUpdated = false;
++
++  MockCompilationDatabase CDB;
+   buildPreamble(
+       FooCpp, *CI, PI,
+-      /*StoreInMemory=*/true,
++      /*ExperimentalModulesSupport=*/false,
++      /*StoreInMemory=*/true, CDB,
+       [&](CapturedASTCtx ASTCtx,
+           std::shared_ptr<const include_cleaner::PragmaIncludes> PI) {
+         auto &Ctx = ASTCtx.getASTContext();
+diff --git a/clang-tools-extra/clangd/unittests/ModuleDependencyScannerTest.cpp b/clang-tools-extra/clangd/unittests/ModuleDependencyScannerTest.cpp
+new file mode 100644
+index 000000000000..d046c02fbff0
+--- /dev/null
++++ b/clang-tools-extra/clangd/unittests/ModuleDependencyScannerTest.cpp
+@@ -0,0 +1,179 @@
++//===------------ ModuleDependencyScannerTest.cpp ---------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++/// FIXME: Skip testing on windows temporarily due to the different escaping
++/// code mode.
++#ifndef _WIN32
++
++#include "ModuleDependencyScanner.h"
++#include "ModulesTestSetup.h"
++#include "TestFS.h"
++
++using namespace clang;
++using namespace clang::clangd;
++using namespace clang::tooling::dependencies;
++
++namespace {
++class ModuleDependencyScannerTests : public ModuleTestSetup {
++  
++};
++
++TEST_F(ModuleDependencyScannerTests, SingleFile) {
++  addFile("foo.h", R"cpp(
++import foo;
++  )cpp");
++
++  addFile("A.cppm", R"cpp(
++module;
++#include "foo.h"
++export module A;
++export import :partA;
++import :partB;
++import C;
++
++module :private;
++import D;
++  )cpp");
++
++  MockCompilationDatabase CDB(TestDir);
++  CDB.ExtraClangFlags.push_back("-std=c++20");
++
++  ModuleDependencyScanner Scanner(CDB, &TFS);
++  std::optional<P1689Rule> ScanningResult = Scanner.scan(getFullPath("A.cppm"));
++  EXPECT_TRUE(ScanningResult);
++
++  EXPECT_TRUE(ScanningResult->Provides);
++  EXPECT_EQ(ScanningResult->Provides->ModuleName, "A");
++
++  EXPECT_EQ(ScanningResult->Requires.size(), 5u);
++  EXPECT_EQ(ScanningResult->Requires[0].ModuleName, "foo");
++  EXPECT_EQ(ScanningResult->Requires[1].ModuleName, "A:partA");
++  EXPECT_EQ(ScanningResult->Requires[2].ModuleName, "A:partB");
++  EXPECT_EQ(ScanningResult->Requires[3].ModuleName, "C");
++  EXPECT_EQ(ScanningResult->Requires[4].ModuleName, "D");
++}
++
++TEST_F(ModuleDependencyScannerTests, GlobalScanning) {
++  addFile("build/compile_commands.json", R"cpp(
++[
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/foo.cppm -fmodule-output=__DIR__/foo.pcm -c -o __DIR__/foo.o",
++  "file": "__DIR__/foo.cppm",
++  "output": "__DIR__/foo.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/C.cppm -fmodule-output=__DIR__/C.pcm -c -o __DIR__/C.o",
++  "file": "__DIR__/C.cppm",
++  "output": "__DIR__/C.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/D.cppm -fmodule-output=__DIR__/D.pcm -c -o __DIR__/D.o",
++  "file": "__DIR__/D.cppm",
++  "output": "__DIR__/D.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/A-partA.cppm -fmodule-file=foo=__DIR__/foo.pcm -fmodule-output=__DIR__/A-partA.pcm -c -o __DIR__/A-partA.o",
++  "file": "__DIR__/A-partA.cppm",
++  "output": "__DIR__/A-partA.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/A-partB.cppm -fmodule-file=C=__DIR__/C.pcm -fmodule-output=__DIR__/A-partB.pcm -c -o __DIR__/A-partB.o",
++  "file": "__DIR__/A-partB.cppm",
++  "output": "__DIR__/A-partB.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/A.cppm -fmodule-file=A:partB=__DIR__/A-partB.pcm -fmodule-file=A:partA=__DIR__/A-partA.pcm -fmodule-file=foo=__DIR__/foo.pcm -fmodule-file=C=__DIR__/C.pcm -fmodule-file=D=__DIR__/C.pcm -fmodule-output=__DIR__/A.pcm -c -o __DIR__/A.o",
++  "file": "__DIR__/A.cppm",
++  "output": "__DIR__/A.o"
++},
++]
++  )cpp");
++
++  addFile("foo.cppm", R"cpp(
++export module foo;
++  )cpp");
++
++  addFile("foo.h", R"cpp(
++import foo;
++  )cpp");
++
++  addFile("A-partA.cppm", R"cpp(
++export module A:partA;
++import foo;
++  )cpp");
++
++  addFile("A-partB.cppm", R"cpp(
++module A:partB;
++import C;
++  )cpp");
++
++  addFile("C.cppm", R"cpp(
++export module C;
++  )cpp");
++
++  addFile("D.cppm", R"cpp(
++export module D;
++  )cpp");
++
++  addFile("A.cppm", R"cpp(
++module;
++#include "foo.h"
++export module A;
++export import :partA;
++import :partB;
++import C;
++
++module :private;
++import D;
++  )cpp");
++
++  std::unique_ptr<GlobalCompilationDatabase> CDB =
++      getGlobalCompilationDatabase();
++  ModuleDependencyScanner Scanner(*CDB.get(), &TFS);
++  Scanner.globalScan(getFullPath("A.cppm"));
++
++  EXPECT_TRUE(Scanner.getSourceForModuleName("foo").endswith("foo.cppm"));
++  EXPECT_TRUE(Scanner.getSourceForModuleName("A").endswith("A.cppm"));
++  EXPECT_TRUE(Scanner.getSourceForModuleName("A:partA").endswith("A-partA.cppm"));
++  EXPECT_TRUE(Scanner.getSourceForModuleName("A:partB").endswith("A-partB.cppm"));
++  EXPECT_TRUE(Scanner.getSourceForModuleName("C").endswith("C.cppm"));
++  EXPECT_TRUE(Scanner.getSourceForModuleName("D").endswith("D.cppm"));
++
++  EXPECT_TRUE(Scanner.getRequiredModules(getFullPath("foo.cppm")).empty());
++  EXPECT_TRUE(Scanner.getRequiredModules(getFullPath("C.cppm")).empty());
++  EXPECT_TRUE(Scanner.getRequiredModules(getFullPath("D.cppm")).empty());
++
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A-partA.cppm")).size(), 1u);
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A-partA.cppm"))[0], "foo");
++
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A-partB.cppm")).size(), 1u);
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A-partB.cppm"))[0], "C");
++
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A.cppm")).size(), 5u);
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A.cppm"))[0], "foo");
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A.cppm"))[1], "A:partA");
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A.cppm"))[2], "A:partB");
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A.cppm"))[3], "C");
++  EXPECT_EQ(Scanner.getRequiredModules(getFullPath("A.cppm"))[4], "D");
++
++  EXPECT_EQ(Scanner.getModuleName(getFullPath("A.cppm")), "A");
++  EXPECT_EQ(Scanner.getModuleName(getFullPath("A-partA.cppm")), "A:partA");
++  EXPECT_EQ(Scanner.getModuleName(getFullPath("A-partB.cppm")), "A:partB");
++  EXPECT_EQ(Scanner.getModuleName(getFullPath("C.cppm")), "C");
++  EXPECT_EQ(Scanner.getModuleName(getFullPath("D.cppm")), "D");
++}
++
++} // namespace
++
++#endif
+diff --git a/clang-tools-extra/clangd/unittests/ModuleFilesInfoTest.cpp b/clang-tools-extra/clangd/unittests/ModuleFilesInfoTest.cpp
+new file mode 100644
+index 000000000000..e7f7352970df
+--- /dev/null
++++ b/clang-tools-extra/clangd/unittests/ModuleFilesInfoTest.cpp
+@@ -0,0 +1,229 @@
++//===--------------- ModuleFilesInfoTests.cpp -------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++/// FIXME: Skip testing on windows temporarily due to the different escaping
++/// code mode.
++#ifndef _WIN32
++
++#include "ModuleFilesInfo.h"
++#include "ModulesTestSetup.h"
++
++using namespace clang;
++using namespace clang::clangd;
++
++namespace {
++class ModuleFilesInfoTests : public ModuleTestSetup {
++  
++};
++
++TEST_F(ModuleFilesInfoTests, ModuleFilesInfoTest) {
++  addFile("build/compile_commands.json", R"cpp(
++[
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/M.cppm -fmodule-output=__DIR__/M.pcm -c -o __DIR__/M.o",
++  "file": "__DIR__/M.cppm",
++  "output": "__DIR__/M.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/N.cppm -fmodule-file=M=__DIR__/M.pcm -fmodule-file=N:Part=__DIR__/N-partition.pcm -fprebuilt-module-path=__DIR__ -fmodule-output=__DIR__/N.pcm -c -o __DIR__/N.o",
++  "file": "__DIR__/N.cppm",
++  "output": "__DIR__/N.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/N-part.cppm -fmodule-output=__DIR__/N-partition.pcm -c -o __DIR__/N-part.o",
++  "file": "__DIR__/N-part.cppm",
++  "output": "__DIR__/N-part.o"
++},
++{
++  "directory": "__DIR__",
++  "command": "clang++ -std=c++20 __DIR__/L.cppm -fmodule-output=__DIR__/L.pcm -c -o __DIR__/L.o",
++  "file": "__DIR__/L.cppm",
++  "output": "__DIR__/L.o"
++}
++]
++  )cpp");
++
++  addFile("foo.h", R"cpp(
++inline void foo() {}
++  )cpp");
++
++  addFile("M.cppm", R"cpp(
++module;
++#include "foo.h"
++export module M;
++  )cpp");
++
++  addFile("N.cppm", R"cpp(
++export module N;
++import :Part;
++import M;
++  )cpp");
++
++  addFile("N-part.cppm", R"cpp(
++// Different name with filename intentionally.
++export module N:Part;
++  )cpp");
++
++  addFile("bar.h", R"cpp(
++inline void bar() {}
++  )cpp");
++
++  addFile("L.cppm", R"cpp(
++module;
++#include "bar.h"
++export module L;
++  )cpp");
++
++  std::unique_ptr<GlobalCompilationDatabase> CDB =
++      getGlobalCompilationDatabase();
++  auto MInfo = ModuleFilesInfo::buildModuleFilesInfoFor(getFullPath("M.cppm"),
++                                                        &TFS, *CDB);
++  // buildModuleFilesInfoFor won't built the module itself.
++  EXPECT_FALSE(MInfo.IsModuleUnitBuilt("M"));
++
++  // Module N shouldn't be able to be built.
++  auto NInfo = ModuleFilesInfo::buildModuleFilesInfoFor(getFullPath("N.cppm"),
++                                                        &TFS, *CDB);
++  EXPECT_TRUE(NInfo.IsModuleUnitBuilt("M"));
++  EXPECT_TRUE(NInfo.getModuleFilePath("M").endswith("M.pcm"));
++  EXPECT_TRUE(NInfo.IsModuleUnitBuilt("N:Part"));
++  EXPECT_TRUE(NInfo.getModuleFilePath("N:Part").endswith("N-Part.pcm"));
++
++  ParseInputs NInput = getInputs("N.cppm", *CDB);
++  std::vector<std::string> CC1Args;
++  std::unique_ptr<CompilerInvocation> Invocation =
++      getCompilerInvocation(NInput);
++  // Test that `ModuleFilesInfo::CanReuse` works basically.
++  EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++  // Test that we can still reuse the NInfo after we touch a unrelated file.
++  {
++    addFile("L.cppm", R"cpp(
++module;
++#include "bar.h"
++export module L;
++export int ll = 43;
++  )cpp");
++    EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++    addFile("bar.h", R"cpp(
++inline void bar() {}
++inline void bar(int) {}
++  )cpp");
++    EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++  }
++
++  // Test that we can't reuse the NInfo after we touch a related file.
++  {
++    addFile("M.cppm", R"cpp(
++module;
++#include "foo.h"
++export module M;
++export int mm = 44;
++  )cpp");
++    EXPECT_FALSE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++    NInfo = ModuleFilesInfo::buildModuleFilesInfoFor(getFullPath("N.cppm"),
++                                                     &TFS, *CDB);
++    EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++    addFile("foo.h", R"cpp(
++inline void foo() {}
++inline void foo(int) {}
++  )cpp");
++    EXPECT_FALSE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++    NInfo = ModuleFilesInfo::buildModuleFilesInfoFor(getFullPath("N.cppm"),
++                                                     &TFS, *CDB);
++    EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++  }
++
++  addFile("N-part.cppm", R"cpp(
++export module N:Part;
++// Intentioned to make it uncompilable.
++export int NPart = 4LIdjwldijaw
++  )cpp");
++  EXPECT_FALSE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++  NInfo = ModuleFilesInfo::buildModuleFilesInfoFor(getFullPath("N.cppm"), &TFS,
++                                                   *CDB);
++  // So NInfo should be unreusable even after rebuild.
++  EXPECT_FALSE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++  addFile("N-part.cppm", R"cpp(
++export module N:Part;
++export int NPart = 43;
++  )cpp");
++  EXPECT_FALSE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++  NInfo = ModuleFilesInfo::buildModuleFilesInfoFor(getFullPath("N.cppm"), &TFS,
++                                                   *CDB);
++  // So NInfo should be unreusable even after rebuild.
++  EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++  // Test that if we changed the modification time of the file, the module files
++  // info is still reusable if its content doesn't change.
++  addFile("N-part.cppm", R"cpp(
++export module N:Part;
++export int NPart = 43;
++  )cpp");
++  EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++  addFile("N.cppm", R"cpp(
++export module N;
++import :Part;
++import M;
++
++export int nn = 43;
++  )cpp");
++  // NInfo should be reusable after we change its content.
++  EXPECT_TRUE(NInfo.CanReuse(*Invocation, TFS.view(TestDir)));
++
++  {
++    llvm::StringRef MPath = NInfo.getModuleFilePath("M");
++    llvm::SmallString<256> ModuleFilesPath = MPath;
++    llvm::sys::path::remove_filename(ModuleFilesPath);
++
++    // Check that
++    // `ModuleFilesInfo::ReplaceCompileCommands(tooling::CompileCommand &Cmd)`
++    // can replace compile commands correctly.
++    std::optional<tooling::CompileCommand> NCmd =
++        CDB->getCompileCommand(getFullPath("N.cppm"));
++    EXPECT_TRUE(NCmd);
++    NInfo.ReplaceCompileCommands(*NCmd);
++    EXPECT_EQ(
++        NCmd->CommandLine[1],
++        llvm::Twine("-fprebuilt-module-path=" + ModuleFilesPath.str()).str());
++    for (auto &Argument : NCmd->CommandLine) {
++      EXPECT_FALSE(llvm::StringRef(Argument).startswith("-fmodule-file=M="));
++      EXPECT_FALSE(
++          llvm::StringRef(Argument).startswith("-fmodule-file=N:Part="));
++    }
++
++    // Check that
++    // `ModuleFilesInfo::ReplaceHeaderSearchOptions(HeaderSearchOptions&)` can
++    // replace HeaderSearchOptions correctly.
++    ParseInputs NInput = getInputs("N.cppm", *CDB);
++    std::vector<std::string> CC1Args;
++    std::unique_ptr<CompilerInvocation> NInvocation =
++        getCompilerInvocation(NInput);
++    HeaderSearchOptions &HSOpts = NInvocation->getHeaderSearchOpts();
++    NInfo.ReplaceHeaderSearchOptions(HSOpts);
++
++    EXPECT_EQ(HSOpts.PrebuiltModulePaths.front(), ModuleFilesPath);
++    for (auto &[ModuleName, _] : HSOpts.PrebuiltModuleFiles) {
++      EXPECT_NE(ModuleName, "M");
++      EXPECT_NE(ModuleName, "N:Part");
++    }
++  }
++}
++
++} // namespace
++
++#endif
+diff --git a/clang-tools-extra/clangd/unittests/ModulesTestSetup.h b/clang-tools-extra/clangd/unittests/ModulesTestSetup.h
+new file mode 100644
+index 000000000000..22cbd04353fe
+--- /dev/null
++++ b/clang-tools-extra/clangd/unittests/ModulesTestSetup.h
+@@ -0,0 +1,105 @@
++//===-- ModulesTestSetup.h - Setup the module test environment --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "Compiler.h"
++#include "support/ThreadsafeFS.h"
++
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include "gmock/gmock.h"
++#include "gtest/gtest.h"
++
++namespace clang {
++namespace clangd {
++class ModuleTestSetup : public ::testing::Test {
++protected:
++  void SetUp() override {
++    ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("modules-test", TestDir));
++  }
++
++  void TearDown() override {
++    llvm::sys::fs::remove_directories(TestDir);
++  }
++
++public:
++  // Add files to the working testing directory and repalce all the
++  // `__DIR__` to TestDir.
++  void addFile(StringRef Path, StringRef Contents) {
++    ASSERT_FALSE(llvm::sys::path::is_absolute(Path));
++
++    SmallString<256> AbsPath(TestDir);
++    llvm::sys::path::append(AbsPath, Path);
++
++    ASSERT_FALSE(llvm::sys::fs::create_directories(
++        llvm::sys::path::parent_path(AbsPath)));
++
++    std::error_code EC;
++    llvm::raw_fd_ostream OS(AbsPath, EC);
++    ASSERT_FALSE(EC);
++
++    std::size_t Pos = Contents.find("__DIR__");
++    while (Pos != llvm::StringRef::npos) {
++      OS << Contents.take_front(Pos);
++      OS << TestDir;
++      Contents = Contents.drop_front(Pos + sizeof("__DIR__") - 1);
++      Pos = Contents.find("__DIR__");
++    }
++
++    OS << Contents;
++  }
++
++  // Get the absolute path for file specified by Path under testing working
++  // directory.
++  std::string getFullPath(StringRef Path) {
++    SmallString<128> Result(TestDir);
++    llvm::sys::path::append(Result, Path);
++    EXPECT_TRUE(llvm::sys::fs::exists(Result.str()));
++    return Result.str().str();
++  }
++
++  std::unique_ptr<GlobalCompilationDatabase> getGlobalCompilationDatabase() {
++    // The compilation flags with modules are much complex so it looks better
++    // to use DirectoryBasedGlobalCompilationDatabase than a mocked compilation
++    // database.
++    DirectoryBasedGlobalCompilationDatabase::Options Opts(TFS);
++    return std::make_unique<DirectoryBasedGlobalCompilationDatabase>(Opts);
++  }
++
++  ParseInputs getInputs(StringRef FileName,
++                        const GlobalCompilationDatabase &CDB) {
++    std::string FullPathName = getFullPath(FileName);
++
++    ParseInputs Inputs;
++    std::optional<tooling::CompileCommand> Cmd =
++        CDB.getCompileCommand(FullPathName);
++    EXPECT_TRUE(Cmd);
++    Inputs.CompileCommand = std::move(*Cmd);
++    Inputs.TFS = &TFS;
++
++    if (auto Contents = TFS.view(TestDir)->getBufferForFile(FullPathName))
++      Inputs.Contents = Contents->get()->getBuffer().str();
++
++    return Inputs;
++  }
++
++  std::unique_ptr<CompilerInvocation>
++  getCompilerInvocation(const ParseInputs &Inputs) {
++    std::vector<std::string> CC1Args;
++    return buildCompilerInvocation(Inputs, DiagConsumer, &CC1Args);
++  }
++
++  SmallString<256> TestDir;
++  // Noticed MockFS but its member variable 'OverlayRealFileSystemForModules'
++  // implies that it will better to use RealThreadsafeFS directly.
++  RealThreadsafeFS TFS;
++
++  DiagnosticConsumer DiagConsumer;
++};
++}
++}
+diff --git a/clang-tools-extra/clangd/unittests/ParsedASTTests.cpp b/clang-tools-extra/clangd/unittests/ParsedASTTests.cpp
+index ec8132645f81..4c7e6c66974d 100644
+--- a/clang-tools-extra/clangd/unittests/ParsedASTTests.cpp
++++ b/clang-tools-extra/clangd/unittests/ParsedASTTests.cpp
+@@ -375,8 +375,10 @@ TEST(ParsedASTTest, PatchesAdditionalIncludes) {
+   MockFS FS;
+   auto Inputs = TU.inputs(FS);
+   auto CI = buildCompilerInvocation(Inputs, Diags);
++  MockCompilationDatabase CDB;
+   auto EmptyPreamble =
+-      buildPreamble(testPath("foo.cpp"), *CI, Inputs, true, nullptr);
++      buildPreamble(testPath("foo.cpp"), *CI, Inputs,
++                    /*ExperimentalModulesSupport=*/false, true, CDB, nullptr);
+   ASSERT_TRUE(EmptyPreamble);
+   EXPECT_THAT(EmptyPreamble->Includes.MainFileIncludes, IsEmpty());
+ 
+@@ -417,8 +419,10 @@ TEST(ParsedASTTest, PatchesDeletedIncludes) {
+   MockFS FS;
+   auto Inputs = TU.inputs(FS);
+   auto CI = buildCompilerInvocation(Inputs, Diags);
++  MockCompilationDatabase CDB;
+   auto BaselinePreamble =
+-      buildPreamble(testPath("foo.cpp"), *CI, Inputs, true, nullptr);
++      buildPreamble(testPath("foo.cpp"), *CI, Inputs,
++                    /*ExperimentalModulesSupport=*/false, true, CDB, nullptr);
+   ASSERT_TRUE(BaselinePreamble);
+   EXPECT_THAT(BaselinePreamble->Includes.MainFileIncludes,
+               ElementsAre(testing::Field(&Inclusion::Written, "<foo.h>")));
+diff --git a/clang-tools-extra/clangd/unittests/PreambleTests.cpp b/clang-tools-extra/clangd/unittests/PreambleTests.cpp
+index 6da98c55e392..1d8a014d5d70 100644
+--- a/clang-tools-extra/clangd/unittests/PreambleTests.cpp
++++ b/clang-tools-extra/clangd/unittests/PreambleTests.cpp
+@@ -196,8 +196,10 @@ TEST(PreamblePatchTest, PatchesPreambleIncludes) {
+   TU.AdditionalFiles["b.h"] = "";
+   TU.AdditionalFiles["c.h"] = "";
+   auto PI = TU.inputs(FS);
+-  auto BaselinePreamble = buildPreamble(
+-      TU.Filename, *buildCompilerInvocation(PI, Diags), PI, true, nullptr);
++  MockCompilationDatabase CDB;
++  auto BaselinePreamble =
++      buildPreamble(TU.Filename, *buildCompilerInvocation(PI, Diags), PI,
++                    /*ExperimentalModulesSupport=*/false, true, CDB, nullptr);
+   // We drop c.h from modified and add a new header. Since the latter is patched
+   // we should only get a.h in preamble includes. d.h shouldn't be part of the
+   // preamble, as it's coming from a disabled region.
+diff --git a/clang-tools-extra/clangd/unittests/TestTU.cpp b/clang-tools-extra/clangd/unittests/TestTU.cpp
+index e65ae825b416..70c64fa3f8db 100644
+--- a/clang-tools-extra/clangd/unittests/TestTU.cpp
++++ b/clang-tools-extra/clangd/unittests/TestTU.cpp
+@@ -107,8 +107,11 @@ TestTU::preamble(PreambleParsedCallback PreambleCallback) const {
+     initializeModuleCache(*CI);
+   auto ModuleCacheDeleter = llvm::make_scope_exit(
+       std::bind(deleteModuleCache, CI->getHeaderSearchOpts().ModuleCachePath));
++  MockCompilationDatabase CDB;
+   return clang::clangd::buildPreamble(testPath(Filename), *CI, Inputs,
+-                                      /*StoreInMemory=*/true, PreambleCallback);
++                                      /*ExperimentalModulesSupport=*/false,
++                                      /*StoreInMemory=*/true, CDB,
++                                      PreambleCallback);
+ }
+ 
+ ParsedAST TestTU::build() const {
+@@ -123,9 +126,12 @@ ParsedAST TestTU::build() const {
+   auto ModuleCacheDeleter = llvm::make_scope_exit(
+       std::bind(deleteModuleCache, CI->getHeaderSearchOpts().ModuleCachePath));
+ 
+-  auto Preamble = clang::clangd::buildPreamble(testPath(Filename), *CI, Inputs,
+-                                               /*StoreInMemory=*/true,
+-                                               /*PreambleCallback=*/nullptr);
++  MockCompilationDatabase CDB;
++  auto Preamble =
++      clang::clangd::buildPreamble(testPath(Filename), *CI, Inputs,
++                                   /*ExperimentalModulesSupport=*/false,
++                                   /*StoreInMemory=*/true, CDB,
++                                   /*PreambleCallback=*/nullptr);
+   auto AST = ParsedAST::build(testPath(Filename), Inputs, std::move(CI),
+                               Diags.take(), Preamble);
+   if (!AST) {
+diff --git a/clang-tools-extra/docs/ReleaseNotes.rst b/clang-tools-extra/docs/ReleaseNotes.rst
+index 19c977977f90..fe56bd1d2db4 100644
+--- a/clang-tools-extra/docs/ReleaseNotes.rst
++++ b/clang-tools-extra/docs/ReleaseNotes.rst
+@@ -48,6 +48,9 @@ Major New Features
+ Improvements to clangd
+ ----------------------
+ 
++- Introduced exmperimental support for C++20 Modules. The experimental support can
++  be enabled by `-experimental-modules-support` option.
++
+ Inlay hints
+ ^^^^^^^^^^^
+ 
+-- 
+2.42.0
+

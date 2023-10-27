@@ -28,12 +28,21 @@ makedepends=('git' 'cmake' 'ninja' 'libffi' 'libedit' 'ncurses' 'libxml2'
              'jsoncpp' 'ocaml-stdlib-shims')
 checkdepends=("python-psutil")
 source=("llvm-project::git+https://github.com/llvm/llvm-project.git"
-        "llvm-config.h")
+        "llvm-config.h"
+        "0001-clangd-C-20-Modules-Introduce-initial-support-for-C-.patch"
+        "0002-Address-comments.patch"
+        "0003-fmt.patch")
 
 md5sums=('SKIP'
-         '295c343dcd457dc534662f011d7cff1a')
+         '295c343dcd457dc534662f011d7cff1a'
+         'SKIP'
+         'SKIP'
+         'SKIP')
 sha512sums=('SKIP'
-            '75e743dea28b280943b3cc7f8bbb871b57d110a7f2b9da2e6845c1c36bf170dd883fca54e463f5f49e0c3effe07fbd0db0f8cf5a12a2469d3f792af21a73fcdd')
+            '75e743dea28b280943b3cc7f8bbb871b57d110a7f2b9da2e6845c1c36bf170dd883fca54e463f5f49e0c3effe07fbd0db0f8cf5a12a2469d3f792af21a73fcdd'
+            'SKIP'
+            'SKIP'
+            'SKIP')
 options=('staticlibs')
 
 # NINJAFLAGS is an env var used to pass commandline options to ninja
@@ -58,6 +67,16 @@ pkgver() {
              END { print "\n" }' \
              CMakeLists.txt)_r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)
     echo "$_pkgver"
+}
+
+prepare() {
+  pushd "$srcdir/llvm-project"
+  
+  patch -Ntp1 -i "$srcdir/0001-clangd-C-20-Modules-Introduce-initial-support-for-C-.patch"
+  patch -Ntp1 -i "$srcdir/0002-Address-comments.patch"
+  patch -Ntp1 -i "$srcdir/0003-fmt.patch"
+
+  popd
 }
 
 build() {

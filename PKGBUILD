@@ -27,22 +27,20 @@ makedepends=('git' 'cmake' 'ninja' 'libffi' 'libedit' 'ncurses' 'libxml2'
              'python-myst-parser' 'lua53' 'ocl-icd' 'opencl-headers' 'z3'
              'jsoncpp' 'ocaml-stdlib-shims')
 checkdepends=("python-psutil")
+
 source=("llvm-project::git+https://github.com/llvm/llvm-project.git"
         "llvm-config.h"
         "0001-clangd-C-20-Modules-Introduce-initial-support-for-C-.patch"
-        "0002-Address-comments.patch"
-        "0003-fmt.patch")
+)
 
 md5sums=('SKIP'
          '295c343dcd457dc534662f011d7cff1a'
          'SKIP'
-         'SKIP'
-         'SKIP')
+)
 sha512sums=('SKIP'
             '75e743dea28b280943b3cc7f8bbb871b57d110a7f2b9da2e6845c1c36bf170dd883fca54e463f5f49e0c3effe07fbd0db0f8cf5a12a2469d3f792af21a73fcdd'
             'SKIP'
-            'SKIP'
-            'SKIP')
+)
 options=('staticlibs')
 
 # NINJAFLAGS is an env var used to pass commandline options to ninja
@@ -71,11 +69,7 @@ pkgver() {
 
 prepare() {
   pushd "$srcdir/llvm-project"
-  
-  patch -Ntp1 -i "$srcdir/0001-clangd-C-20-Modules-Introduce-initial-support-for-C-.patch"
-  patch -Ntp1 -i "$srcdir/0002-Address-comments.patch"
-  patch -Ntp1 -i "$srcdir/0003-fmt.patch"
-
+  patch -Np1 -i "$srcdir/0001-clangd-C-20-Modules-Introduce-initial-support-for-C-.patch"
   popd
 }
 
@@ -87,6 +81,12 @@ build() {
         -B _build \
         -S "$srcdir"/llvm-project/llvm  \
         -G Ninja \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DLLVM_USE_LINKER=lld \
+        -DLLVM_TARGETS_TO_BUILD=Native \
+        -DCLANG_ENABLE_BOOTSTRAP=ON \
+        -DCLANG_DEFAULT_CXX_STDLIB=libc++ \
+        -DCLANG_DEFAULT_RTLIB=compiler-rt \
         -D CMAKE_BUILD_TYPE=Release \
         -D CMAKE_INSTALL_PREFIX=/usr \
         -D LLVM_BINUTILS_INCDIR=/usr/include \
@@ -107,9 +107,34 @@ build() {
         -D POLLY_ENABLE_GPGPU_CODEGEN=ON \
         -D LLDB_USE_SYSTEM_SIX=1 \
         -D LLVM_ENABLE_PROJECTS="polly;lldb;lld;compiler-rt;clang-tools-extra;clang" \
-        -D LLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
+        -D LLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind;pstl" \
         -D LLVM_LIT_ARGS="-sv --ignore-fail" \
         -D LLVM_ENABLE_DUMP=ON \
+        -D LIBCXX_ENABLE_PARALLEL_ALGORITHMS=ON \
+        -D LIBCXX_ENABLE_PARALLEL_ALGORITHMS=ON \
+        -DLIBCXX_ENABLE_STD_MODULES=ON\
+        -DLIBCXX_USE_COMPILER_RT=YES \
+        -DLIBCXXABI_USE_COMPILER_RT=YES \
+        -DLIBCXXABI_USE_LLVM_UNWINDER=YES \
+        -DLIBCXX_ENABLE_LOCALIZATION=ON\
+        -DLIBCXX_ENABLE_WIDE_CHARACTERS=ON\
+        -DLIBCXX_ENABLE_THREADS=ON\
+        -DLIBCXX_ENABLE_FILESYSTEM=ON\
+        -DLIBCXX_ENABLE_RANDOM_DEVICE=ON\
+        -DLIBCXX_ENABLE_UNICODE=ON\
+        -DLIBCXX_ENABLE_EXCEPTIONS=ON\
+        -DPSTL_PARALLEL_BACKEND="tbb" \
+        -DBOOTSTRAP_CMAKE_BUILD_TYPE=Release \
+        -DBOOTSTRAP_LLVM_ENABLE_PROJECTS="polly;lldb;lld;compiler-rt;clang-tools-extra;clang" \
+        -DBOOTSTRAP_LLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind;pstl" \
+        -DBOOTSTRAP_CLANG_DEFAULT_CXX_STDLIB=libc++ \
+        -DBOOTSTRAP_CLANG_DEFAULT_RTLIB=compiler-rt \
+        -DBOOTSTRAP_LIBCXX_USE_COMPILER_RT=YES \
+        -DBOOTSTRAP_LIBCXXABI_USE_COMPILER_RT=YES \
+        -DBOOTSTRAP_LIBCXXABI_USE_LLVM_UNWINDER=YES \
+        -DBOOTSTRAP_LLVM_USE_LINKER=lld \
+        -DLIBUNWIND_USE_COMPILER_RT=Yes \
+        -DBOOTSTRAP_LIBUNWIND_USE_COMPILER_RT=Yes \
         -Wno-dev
 
     ninja -C _build $NINJAFLAGS
@@ -144,6 +169,9 @@ package_llvm-git() {
     pushd llvm-project/llvm/utils/lit
     python setup.py install --root="$pkgdir" -O1
     popd
+
+    exa -T -L1 "$pkgdir"
+    exa -T -L1 "$srcdir"
 
     # Move libraries from platform-specific directory to standard directory
     cp -r "$pkgdir"/usr/lib/x86_64-pc-linux-gnu/* "$pkgdir"/usr/lib/
